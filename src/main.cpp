@@ -22,11 +22,14 @@ const char* NETWORK_NAME = "Waveshare75-HA-dashboard";
 const char* bmpUrls[] = {
   "https://qrwmbaypgxaexdohocwh.supabase.co/functions/v1/xkcd-bmp",
    "http://homeassistant:5000/4",
-   "http://homeassistant:5000/1",
+  //  "http://homeassistant:5000/1",
    "http://homeassistant:5000/3",
-   "http://homeassistant:5000/2"
+  //  "http://homeassistant:5000/2"
 };
 static const int NUM_URLS = sizeof(bmpUrls) / sizeof(bmpUrls[0]);
+
+// Brightness threshold for dithering - pixels darker than this will be forced to black without dithering
+static const int DITHERING_BLACK_LEVEL = 16;
 
 
 int currentUrlIndex = 0;
@@ -282,9 +285,16 @@ bool downloadBMP(const char* url) {
   http.end();
   return true;
 }
-
 void handle8BitImageData(int width, WiFiClient *stream)
 {
+  // 4x4 Bayer ordered dithering matrix (0-15)
+  const uint8_t bayerMatrix[4][4] = {
+    {0,  8,  2,  10},
+    {12, 4,  14, 6},
+    {3,  11, 1,  9},
+    {15, 7,  13, 5}
+  };
+
   int rowSize = ((width + 3) / 4) * 4;
   uint8_t row[rowSize];
 
@@ -295,7 +305,20 @@ void handle8BitImageData(int width, WiFiClient *stream)
     {
       if (x < width) { // Bounds check
         uint8_t pixel = row[x];     // 0–255
-        uint8_t level = pixel >> 6; // 0–3
+        
+        uint8_t level;
+        
+        // Never brighten black pixels with dithering
+        if (pixel < DITHERING_BLACK_LEVEL) {
+          level = 0; // Force black, no dithering
+        } else {
+          // Apply ordered dithering for non-black pixels
+          uint8_t ditherThreshold = bayerMatrix[y % 4][x % 4];
+          int ditheredPixel = pixel + (ditherThreshold * 16);
+          if (ditheredPixel > 255) ditheredPixel = 255;
+          
+          level = ditheredPixel >> 6; // Divide 0-255 into 0-3
+        }
 
         int index = y * DISPLAY_WIDTH + x;
         int byteIndex = index / 4;
@@ -311,6 +334,14 @@ void handle8BitImageData(int width, WiFiClient *stream)
 
 void handle24BitImageData(int width, int height, WiFiClient *stream, int xStart, int yStart, uint8_t* buffer, size_t bufferSize)
 {
+  // 4x4 Bayer ordered dithering matrix (0-15)
+  const uint8_t bayerMatrix[4][4] = {
+    {0,  8,  2,  10},
+    {12, 4,  14, 6},
+    {3,  11, 1,  9},
+    {15, 7,  13, 5}
+  };
+
   int rowSize = ((width * 3 + 3) / 4) * 4;
   uint8_t row[rowSize];
 
@@ -330,24 +361,35 @@ void handle24BitImageData(int width, int height, WiFiClient *stream, int xStart,
       uint8_t r = row[x * 3 + 2];
       // Convert to grayscale (simple average)
       uint8_t gray = (uint16_t(r) + uint16_t(g) + uint16_t(b)) / 3;
-      // Map grayscale to 2-bit level with adjustable thresholds
-      uint8_t level;
-      if (gray < 64) {
-        level = 0; // darkest
-      } else if (gray < 128) {
-        level = 1;
-      // } else if (gray < 192) {
-      } else if (gray < 212) {
-        level = 2;
-      } else {
-        level = 3; // lightest
-      }
-
+      
       int pixelX = xStart + x;
       int pixelY = yStart + y;
       
       // Bounds check: only write if pixel is within display area
       if (pixelX >= 0 && pixelX < DISPLAY_WIDTH && pixelY >= 0 && pixelY < DISPLAY_HEIGHT) {
+        uint8_t level;
+        
+        // Never brighten black pixels with dithering
+        if (gray < DITHERING_BLACK_LEVEL) {
+          level = 0; // Force black, no dithering
+        } else {
+          // Apply ordered dithering for non-black pixels
+          uint8_t ditherThreshold = bayerMatrix[pixelY % 4][pixelX % 4];
+          int ditheredGray = gray + (ditherThreshold * 4);
+          if (ditheredGray > 255) ditheredGray = 255;
+          
+          // Map to 2-bit level (0-3) with dithering
+          if (ditheredGray < 64) {
+            level = 0;
+          } else if (ditheredGray < 128) {
+            level = 1;
+          } else if (ditheredGray < 212) {
+            level = 2;
+          } else {
+            level = 3;
+          }
+        }
+
         int index = pixelY * DISPLAY_WIDTH + pixelX;
         int byteIndex = index / 4;
         int shift = (3 - (index % 4)) * 2;
