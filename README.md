@@ -1,6 +1,10 @@
-# Waveshare75-HA-dashboard
+# Waveshare75-ImageDisplay
 
-A C++ project for ESP32/ESP8266 microcontrollers to display Home Assistant dashboard data on Waveshare 7.5" e-paper displays.
+A C++ project for ESP32/ESP8266 microcontrollers to display download and display images using HTTP.
+
+The main motivation for this project was to display Home Assistant dashboard data on Waveshare 7.5" e-paper displays, but other images are also possible.
+
+Currently, only images in BMP format are supported.
 
 <p align="center">
   <img src="content/frame.png" alt="Dashboard Frame" style="border:1px solid #000;"/>
@@ -11,12 +15,16 @@ A C++ project for ESP32/ESP8266 microcontrollers to display Home Assistant dashb
 
 ## Overview
 
-This project provides firmware for ESP32/ESP8266 boards to create a low-power, always-on dashboard that displays Home Assistant data on Waveshare e-paper displays. The e-paper technology ensures excellent readability and minimal power consumption.
+This project provides firmware for ESP32/ESP8266 boards to create a low-power, always-on dashboard that displays Home Assistant data on Waveshare e-paper displays by download BMP files with the dashboard in image format.
 
 The code is based on the [demo code provided by Waveshare](https://github.com/waveshareteam/e-Paper), and modified to work with the specific use case of downloading screen shot images from Home Assistant and displaying them on the e-paper display.
 
-## Hardware Requirements
+The images are generated in **Home Assistant** using the [Home Assistant Lovelace Kindle Screensaver](https://github.com/sibbl/hass-lovelace-kindle-screensaver) plugin that creates a scheduled job that
+takes screenshots of the dashboards and saves them to BMP files. These can then be downloaded to the ESP32 via the local network and displayed on the e-paper display. The reasopn for this setup is that the ESP32/ESP8266 does not have enough processing power to render the Home Assistant dashboards directly, so we rely on Home Assistant to generate the images. 
 
+# Requirements
+
+## Hardware
 - **Microcontroller**: ESP32 or ESP8266 development board
   - I used the [Waveshare Universal e-Paper Raw Panel Driver Board](https://www.waveshare.com/e-paper-esp32-driver-board.htm)
 - **Display**: Waveshare 7.5" e-paper display with black + 2 gray levels
@@ -27,10 +35,10 @@ The code is based on the [demo code provided by Waveshare](https://github.com/wa
   - I used the [IKEA Lomviken](https://www.ikea.com/se/sv/p/lomviken-ram-svart-70518202/) 13x18 cm frame which looks pretty good. Unfortunately the passe-partout hides the edges of the display, so I needed to make sure that there are empty margins around display contents. 
 
 
-## Software Requirements
+## Software
 
 - **PlatformIO**: For building and uploading the firmware
-- **Home Assistant**: Since the ESP32 is far too weak to render HTML content, a scheduled job [Home Assistant Lovelace Kindle Screensaver](https://github.com/sibbl/hass-lovelace-kindle-screensaver) is set up on the Home Assistant server to take a screenshot of the dashboards and save them to BMP files. These can then be downloaded to the ESP32 via the local network and displayed on the e-paper display.
+
 
 ## Project Structure
 
