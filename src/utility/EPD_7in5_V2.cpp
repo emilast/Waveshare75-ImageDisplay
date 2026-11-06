@@ -83,13 +83,22 @@ static void EPD_SendData2(UBYTE *pData, UDOUBLE len)
 function :	Wait until the busy_pin goes LOW
 parameter:
 ******************************************************************************/
+// Upper bound for a single busy period. A full 4-gray refresh takes a few
+// seconds; anything far beyond that means the panel is disconnected or stuck.
+#define EPD_BUSY_TIMEOUT_MS 20000
+
 static void EPD_WaitUntilIdle(void)
 {
     Debug("e-Paper busy\r\n");
+    unsigned long start = millis();
 	do{
-		DEV_Delay_ms(5);  
-	}while(!(DEV_Digital_Read(EPD_BUSY_PIN)));   
-	DEV_Delay_ms(5);      
+		DEV_Delay_ms(5);
+		if (millis() - start > EPD_BUSY_TIMEOUT_MS) {
+			Serial.println("e-Paper busy timeout, panel not responding");
+			return;
+		}
+	}while(!(DEV_Digital_Read(EPD_BUSY_PIN)));
+	DEV_Delay_ms(5);
     Debug("e-Paper busy release\r\n");
 }
 /******************************************************************************

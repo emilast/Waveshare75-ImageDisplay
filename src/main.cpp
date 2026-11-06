@@ -6,6 +6,7 @@
 
 #include <WiFiManager.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 #define DISPLAY_WIDTH EPD_7IN5_V2_WIDTH
 #define DISPLAY_HEIGHT EPD_7IN5_V2_HEIGHT
@@ -28,32 +29,75 @@ const char* bmpUrls[] = {
 };
 static const int NUM_URLS = sizeof(bmpUrls) / sizeof(bmpUrls[0]);
 
+// Time zone (POSIX TZ string) used for the clock overlay
+static const char* TIME_ZONE = "CET-1CEST,M3.5.0,M10.5.0/3";
+
 // Brightness threshold for dithering - pixels darker than this will be forced to black without dithering
 static const int DITHERING_BLACK_LEVEL = 16;
 
+// Images smaller than the display are centered and then shifted down by this
+// many pixels (but never so far that the bottom of the image is cut off).
+static const int IMAGE_Y_OFFSET = 20;
 
-int currentUrlIndex = 0;
+// Time between screen updates
+static const unsigned long REFRESH_INTERVAL_MS = 60000;
 
+// Network timeouts
+static const uint32_t HTTP_CONNECT_TIMEOUT_MS = 5000;
+static const uint16_t HTTP_READ_TIMEOUT_MS = 10000;
+static const int WIFI_CONNECT_TIMEOUT_S = 20;
+static const int WIFI_PORTAL_TIMEOUT_S = 180; // Restart if nobody configures WiFi within this time
+
+// Restart the device after this many failed update cycles in a row
+static const int MAX_CONSECUTIVE_FAILURES = 5;
+
+// Maximum number of bytes between the BMP header and the pixel data (palette etc.)
+static const int MAX_HEADER_SKIP = 4096;
+
+static const int BMP_HEADER_SIZE = 54;
+
+// 4x4 Bayer ordered dithering matrix (0-15)
+static const uint8_t BAYER_MATRIX[4][4] = {
+  {0,  8,  2,  10},
+  {12, 4,  14, 6},
+  {3,  11, 1,  9},
+  {15, 7,  13, 5}
+};
+
+// Display buffer, 2 bits per pixel (0=black, 1=dark gray, 2=light gray, 3=white)
 uint8_t* buffer = nullptr; // Will be allocated dynamically
 size_t bufferSize = 0;
 
-bool downloadBMP(const char *url);
-void handle8BitImageData(int width, WiFiClient *stream);
-void handle24BitImageData(int width, int height, WiFiClient *stream, int x, int y, uint8_t* buffer, size_t bufferSize);
+int currentUrlIndex = 0;
+int consecutiveFailures = 0;
 
-// Set pixel in 2bpp buffer
+// Result of trying to fetch and decode an image
+enum DownloadResult {
+  DOWNLOAD_OK,          // Image decoded into buffer, ready to display
+  DOWNLOAD_HTTP_ERROR,  // Error message drawn into buffer, should be displayed
+  DOWNLOAD_FAILED       // Nothing usable in buffer, keep current screen content
+};
+
+DownloadResult downloadBMP(const char *url);
+bool decodeBMPImageData(WiFiClient *stream, int bitDepth, int width, int height, bool topDown);
+
+// Set pixel in 2bpp buffer. Pixels outside the display are ignored.
 // x, y = pixel coordinate
 // color = 0=black, 1=dark gray, 2=light gray, 3=white
-void SetPixel2bpp(uint8_t* buffer, int width, int x, int y, uint8_t color) {
-  int index = (y * width + x);
+void SetPixel2bpp(uint8_t* buffer, int x, int y, uint8_t color) {
+  if (x < 0 || x >= DISPLAY_WIDTH || y < 0 || y >= DISPLAY_HEIGHT) {
+    return;
+  }
+  int index = (y * DISPLAY_WIDTH + x);
   int byteIndex = index / 4;          // 4 pixels per byte
   int shift = (3 - (index % 4)) * 2;  // which 2-bit field
   buffer[byteIndex] &= ~(0x3 << shift);       // clear bits
   buffer[byteIndex] |= ((color & 0x3) << shift); // set color
 }
 
-// Draw a string with any font size from sFONT
-void DrawString2bpp(uint8_t* buffer, int width, int x, int y, 
+// Draw a string with any font size from sFONT. Text running past the right
+// edge of the display is cut off.
+void DrawString2bpp(uint8_t* buffer, int x, int y,
       const char* text, uint8_t textColor, uint8_t bgColor, uint8_t transparentBg,
       sFONT* font) {
   int charWidth = font->Width;
@@ -61,51 +105,73 @@ void DrawString2bpp(uint8_t* buffer, int width, int x, int y,
   int bytesPerRow = (charWidth + 7) / 8;
   int bytesPerChar = bytesPerRow * charHeight;
 
-  // log bytes info, including width and height, bytesPerRow
-  // Serial.printf("Character: %c, Bytes per char: %d, Width: %d, Height: %d, Bytes per row: %d\n", *text, bytesPerChar, charWidth, charHeight, bytesPerRow);
+  while (*text && x < DISPLAY_WIDTH) {
+    char c = *text;
+    if (c < 32 || c > 126) {
+      c = '?'; // fallback
+    }
+    int charIndex = (c - 32) * bytesPerChar;
 
-  while (*text) {
-  char c = *text;
-  if (c < 32 || c > 126) {
-    c = '?'; // fallback
-  }
-  int charIndex = (c - 32) * bytesPerChar;
+    for (int row = 0; row < charHeight; row++) {
+      for (int col = 0; col < charWidth; col++) {
+        int byteInRow = col / 8;
+        int bitInByte = 7 - (col % 8);
+        uint8_t lineByte = font->table[charIndex + row * bytesPerRow + byteInRow];
 
-  for (int row = 0; row < charHeight; row++) {
-    for (int col = 0; col < charWidth; col++) {
-      int byteInRow = col / 8;
-      int bitInByte = 7 - (col % 8);
-      uint8_t lineByte = font->table[charIndex + row * bytesPerRow + byteInRow];
+        bool useBgPixel =
+          (transparentBg == SOLID) || // Solid background, all pixels drawn
+          (transparentBg == TRANSPARENT2 && ((y + row + x + col) % 2 == 0)) ||
+          (transparentBg == TRANSPARENT3 && ((y + row + x + col) % 5 == 0)) ||
+          (transparentBg == TRANSPARENT4 && ((y + row + x + col) % 9 == 0));
 
-      bool useBgPixel =
-        (transparentBg == SOLID) || // Solid background, all pixels drawn
-        (transparentBg == TRANSPARENT2 && ((y + row + x + col) % 2 == 0)) ||
-        (transparentBg == TRANSPARENT3 && ((y + row + x + col) % 5 == 0)) ||
-        (transparentBg == TRANSPARENT4 && ((y + row + x + col) % 9 == 0));
-
-      if (lineByte & (1 << bitInByte)) {
-        SetPixel2bpp(buffer, width, x + col, y + row, textColor);
-      } else {
-        if (useBgPixel) {
-          SetPixel2bpp(buffer, width, x + col, y + row, bgColor);
+        if (lineByte & (1 << bitInByte)) {
+          SetPixel2bpp(buffer, x + col, y + row, textColor);
+        } else if (useBgPixel) {
+          SetPixel2bpp(buffer, x + col, y + row, bgColor);
         }
       }
     }
+    x += charWidth; // next character
+    text++;
   }
-  x += charWidth; // next character
-  text++;
+}
+
+// Little-endian helpers for parsing the BMP header without unaligned access
+static uint32_t readLE32(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint16_t readLE16(const uint8_t* p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+// Read exactly len bytes from the stream, waiting up to the stream timeout.
+static bool readExact(WiFiClient* stream, uint8_t* dest, size_t len) {
+  return stream->readBytes(dest, len) == len;
+}
+
+// Discard len bytes from the stream, waiting up to the stream timeout.
+static bool skipBytes(WiFiClient* stream, size_t len) {
+  uint8_t scratch[64];
+  while (len > 0) {
+    size_t chunk = len < sizeof(scratch) ? len : sizeof(scratch);
+    if (!readExact(stream, scratch, chunk)) {
+      return false;
+    }
+    len -= chunk;
   }
+  return true;
+}
+
+// True once NTP has provided a plausible wall-clock time
+static bool isTimeValid() {
+  return time(nullptr) > 1700000000; // Nov 2023
 }
 
 /* Entry point ----------------------------------------------------------------*/
 void setup()
 {
   DEV_Module_Init();
-
-  // Startup message
-  EPD_7IN5_V2_Init_Fast(); // Fast => Less flicker when displaying the screen
-  Paint_SelectImage(buffer);
-  Paint_Clear(WHITE);
 
   // Allocate image buffer dynamically
   bufferSize = DISPLAY_WIDTH * DISPLAY_HEIGHT / 4;
@@ -116,7 +182,12 @@ void setup()
   }
   memset(buffer, 0xFF, bufferSize);
   Paint_NewImage(buffer, DISPLAY_WIDTH, DISPLAY_HEIGHT, 0, WHITE);
-  Serial.printf("Allocated %d bytes for display buffer\n", bufferSize);
+  Serial.printf("Allocated %u bytes for display buffer\n", (unsigned)bufferSize);
+
+  // Startup message
+  EPD_7IN5_V2_Init_Fast(); // Fast => Less flicker when displaying the screen
+  Paint_SelectImage(buffer);
+  Paint_Clear(WHITE);
 
   // WiFi connection via WifiManager
   Paint_DrawString_EN(70, 50, "Connecting to Wifi network...", &Font16, WHITE, BLACK);
@@ -124,35 +195,36 @@ void setup()
   Paint_DrawString_EN(90, 130, NETWORK_NAME, &Font16, WHITE, BLACK);
   Paint_DrawString_EN(70, 170, "to configure network settings.", &Font12, WHITE, BLACK);
 
-  EPD_7IN5_V2_Display(buffer); // Offsetfel
+  EPD_7IN5_V2_Display(buffer);
+  EPD_7IN5_V2_Sleep(); // Don't keep the panel powered while waiting for WiFi
 
   WiFiManager wm;
+  wm.setConnectTimeout(WIFI_CONNECT_TIMEOUT_S);
+  // Without a timeout the configuration portal waits forever, e.g. when the
+  // device boots faster than the router after a power cut.
+  wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT_S);
   bool res = wm.autoConnect(NETWORK_NAME);
   if (!res) {
-    Serial.println("Failed to connect to WiFi");
+    Serial.println("Failed to connect to WiFi, restarting");
     ESP.restart();
   }
   Serial.println("Connected to WiFi");
+  WiFi.setAutoReconnect(true);
 
+  // Get current time from time server and set local time zone
+  configTzTime(TIME_ZONE, "pool.ntp.org", "time.nist.gov");
 
-  // Get current time from time server
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   struct tm timeinfo;
-  
-  // Set timezone to CEST (Central European Summer Time)
-  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
-  tzset();
-  
-  if (!getLocalTime(&timeinfo, 10000)) {
-    Serial.println("Failed to obtain time");
+  if (getLocalTime(&timeinfo, 10000)) {
+    Serial.printf("Current date and time: %04d-%02d-%02dT%02d:%02d:%02d\n",
+                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  } else {
+    Serial.println("Failed to obtain time, will keep trying in the background");
   }
 
-  Serial.printf("Current date and time: %04d-%02d-%02dT%02d:%02d:%02d\n",
-                timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-                timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-
   EPD_7IN5_V2_Init_Fast(); // Fast => Less flicker when displaying the screen
-  printf("Startup screen...\r\n");
+  Serial.println("Startup screen...");
   Paint_SelectImage(buffer);
   Paint_Clear(WHITE);
   Paint_DrawString_EN(70, 50, "Initializing...", &Font16, WHITE, BLACK);
@@ -163,241 +235,271 @@ void setup()
     yStart += 20;
   }
 
-  EPD_7IN5_V2_Display(buffer); // Offsetfel
+  EPD_7IN5_V2_Display(buffer);
   EPD_7IN5_V2_Sleep();
+}
+
+// Called after each update cycle. Tries to recover the WiFi connection and
+// restarts the device if updates keep failing.
+static void handleUpdateResult(bool success) {
+  if (success) {
+    consecutiveFailures = 0;
+    return;
+  }
+
+  consecutiveFailures++;
+  Serial.printf("Update failed (%d in a row)\n", consecutiveFailures);
+
+  if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+    Serial.println("Too many consecutive failures, restarting");
+    ESP.restart();
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected, reconnecting");
+    WiFi.reconnect();
+  }
 }
 
 void loop()
 {
-  EPD_7IN5_V2_Init_4Gray();
-
   memset(buffer, 0xFF, bufferSize);
 
-  Paint_SelectImage(buffer);
-
-  // Iterate over
+  // Iterate over the image URLs
   const char* url = bmpUrls[currentUrlIndex];
   currentUrlIndex = (currentUrlIndex + 1) % NUM_URLS;
 
-  if (downloadBMP(url)) {
-      printf("BMP downloaded successfully!\n");
-      // Get current time
+  // Download and decode first; the panel is only powered up when there is
+  // something to show.
+  DownloadResult result = downloadBMP(url);
+
+  if (result == DOWNLOAD_OK) {
+    Serial.println("BMP downloaded successfully!");
+
+    if (isTimeValid()) {
       time_t now = time(nullptr);
-      struct tm* timeinfo = localtime(&now);
+      struct tm timeinfo;
+      localtime_r(&now, &timeinfo);
       char timeStr[16];
-      strftime(timeStr, sizeof(timeStr), "%H:%M", timeinfo);
-
-      // DrawString2bpp(buffer, DISPLAY_WIDTH, 70, 440, timeStr, BLACK, GRAY3, TRANSPARENT, &Font24);
-      DrawString2bpp(buffer, DISPLAY_WIDTH, 70, 440, timeStr, BLACK, WHITE, TRANSPARENT2, &Font24);
-
-      EPD_7IN5_V2_Display_4Gray(buffer);
-      EPD_7IN5_V2_Sleep(); // Turn off screen power until next call to EPD_7IN5_V2_Init*().
-  }
-    else {
-      printf("Failed to download BMP image.\n");
+      strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+      DrawString2bpp(buffer, 70, 440, timeStr, BLACK, WHITE, TRANSPARENT2, &Font24);
+    }
+  } else {
+    Serial.println("Failed to download BMP image.");
   }
 
-  DEV_Delay_ms(60000);
-  // delay(60000);
+  if (result != DOWNLOAD_FAILED) {
+    EPD_7IN5_V2_Init_4Gray();
+    EPD_7IN5_V2_Display_4Gray(buffer);
+    EPD_7IN5_V2_Sleep(); // Turn off screen power until next call to EPD_7IN5_V2_Init*().
+  }
+
+  handleUpdateResult(result == DOWNLOAD_OK);
+
+  DEV_Delay_ms(REFRESH_INTERVAL_MS);
+}
+
+// Draws an HTTP/network error message into the display buffer
+static void drawHttpError(const char* url, int httpCode, const char* message) {
+  char codeStr[64];
+  snprintf(codeStr, sizeof(codeStr), "HTTP error, status code: %d", httpCode);
+  DrawString2bpp(buffer, 70, 50, codeStr, BLACK, WHITE, TRANSPARENT2, &Font16);
+  DrawString2bpp(buffer, 70, 70, url, BLACK, WHITE, TRANSPARENT2, &Font12);
+  DrawString2bpp(buffer, 70, 90, message, BLACK, WHITE, TRANSPARENT2, &Font12);
 }
 
 // Downloads a BMP image from the given URL and decodes it into the display buffer.
-// Supports 8-bit (grayscale) and 24-bit (RGB) BMPs with dimensions matching the display.
-bool downloadBMP(const char* url) {
+// Supports uncompressed 8-bit (grayscale) and 24-bit (RGB) BMPs that are no
+// larger than the display. Smaller images are centered.
+DownloadResult downloadBMP(const char* url) {
   Serial.printf("Downloading BMP from: %s\n", url);
+
+  // Use an explicit client so that HTTPS behaves the same on all core versions.
+  // The certificate is not verified; add setCACert() here if that is needed.
+  WiFiClient plainClient;
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+  bool isHttps = strncmp(url, "https://", 8) == 0;
+  WiFiClient& client = isHttps ? (WiFiClient&)secureClient : plainClient;
 
   HTTPClient http;
   http.useHTTP10(true); // Disable chunked transfer encoding for compatibility
-  http.begin(url);
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_READ_TIMEOUT_MS);
+
+  if (!http.begin(client, url)) {
+    Serial.println("Invalid URL");
+    drawHttpError(url, 0, "Invalid URL");
+    return DOWNLOAD_HTTP_ERROR;
+  }
+
   int httpCode = http.GET();
 
   if (httpCode != HTTP_CODE_OK) {
     Serial.printf("HTTP error: %d\n", httpCode);
 
-    // Get error message from server/network if available
-    String errorMsg = http.getString();
-    if (errorMsg.length() == 0) {
-      errorMsg = "(No error message)";
+    // Get error message from server/network if available. Only the start of
+    // the body is read so a large error page can't exhaust memory.
+    char errBuf[128] = "";
+    if (httpCode < 0) {
+      strlcpy(errBuf, HTTPClient::errorToString(httpCode).c_str(), sizeof(errBuf));
+    } else {
+      WiFiClient* stream = http.getStreamPtr();
+      if (stream != nullptr) {
+        size_t n = stream->readBytes((uint8_t*)errBuf, sizeof(errBuf) - 1);
+        errBuf[n] = '\0';
+      }
     }
+    // Keep the message on one line
+    for (char* p = errBuf; *p; p++) {
+      if (*p == '\r' || *p == '\n' || *p == '\t') *p = ' ';
+    }
+    if (errBuf[0] == '\0') {
+      strlcpy(errBuf, "(No error message)", sizeof(errBuf));
+    }
+    Serial.printf("Error message: %s\n", errBuf);
 
-    // Show error message on screen
-    char codeStr[64];
-    snprintf(codeStr, sizeof(codeStr), "HTTP error, status code: %d", httpCode);
-    DrawString2bpp(buffer, DISPLAY_WIDTH, 70, 50, codeStr, BLACK, WHITE, TRANSPARENT2, &Font16);
-
-    DrawString2bpp(buffer, DISPLAY_WIDTH, 70, 70, url, BLACK, WHITE, TRANSPARENT2, &Font12);
-
-    // Truncate errorMsg if too long for display
-    char errBuf[128];
-    strncpy(errBuf, errorMsg.c_str(), sizeof(errBuf) - 1);
-    errBuf[sizeof(errBuf) - 1] = '\0';
-    DrawString2bpp(buffer, DISPLAY_WIDTH, 70, 90, errBuf, BLACK, WHITE, TRANSPARENT2, &Font12);
-
-    EPD_7IN5_V2_Display_4Gray(buffer);
-
+    drawHttpError(url, httpCode, errBuf);
     http.end();
-    return false;
+    return DOWNLOAD_HTTP_ERROR;
   }
 
   WiFiClient* stream = http.getStreamPtr();
 
-  // Read BMP header (54 bytes)
-  uint8_t header[54];
-  stream->readBytes(header, 54);
+  // Read BMP file header + BITMAPINFOHEADER (54 bytes)
+  uint8_t header[BMP_HEADER_SIZE];
+  if (!readExact(stream, header, sizeof(header))) {
+    Serial.println("Failed to read BMP header");
+    http.end();
+    return DOWNLOAD_FAILED;
+  }
 
   // Simple check: should start with 'BM'
   if (header[0] != 'B' || header[1] != 'M') {
     Serial.println("Not a BMP file");
     http.end();
-    return false;
+    return DOWNLOAD_FAILED;
   }
 
-  int dataOffset = *(int*)&header[10];
-  int width = *(int*)&header[18];
-  int height = *(int*)&header[22];
-  uint16_t bitDepth = *(uint16_t*)&header[28];
+  uint32_t dataOffset = readLE32(&header[10]);
+  int32_t width = (int32_t)readLE32(&header[18]);
+  int32_t height = (int32_t)readLE32(&header[22]);
+  uint16_t bitDepth = readLE16(&header[28]);
+  uint32_t compression = readLE32(&header[30]);
 
-  Serial.printf("Image downloaded: %dx%d, %d-bit color depth\n", width, height, bitDepth);
+  // Negative height means rows are stored top-down instead of bottom-up
+  bool topDown = height < 0;
+  if (topDown) {
+    height = -height;
+  }
 
-  // Validate image size and color depth
-  if ((bitDepth != 8 && bitDepth != 24)) {
-    Serial.println("Incorrect image size or color depth");
-    Serial.printf("Expected: %dx%d, 8- or 24-bit color depth\n", DISPLAY_WIDTH, DISPLAY_HEIGHT);
-    Serial.printf("Data offset: %d\n", dataOffset);
+  Serial.printf("Image downloaded: %dx%d, %d-bit color depth%s\n",
+                (int)width, (int)height, bitDepth, topDown ? ", top-down" : "");
+
+  // Validate image size, color depth and format
+  if ((bitDepth != 8 && bitDepth != 24) || compression != 0 ||
+      width <= 0 || width > DISPLAY_WIDTH ||
+      height <= 0 || height > DISPLAY_HEIGHT ||
+      dataOffset < BMP_HEADER_SIZE || dataOffset > BMP_HEADER_SIZE + MAX_HEADER_SKIP) {
+    Serial.println("Unsupported image size, color depth or format");
+    Serial.printf("Expected: max %dx%d, uncompressed 8- or 24-bit color depth\n", DISPLAY_WIDTH, DISPLAY_HEIGHT);
+    Serial.printf("Got: compression %u, data offset %u\n", (unsigned)compression, (unsigned)dataOffset);
     http.end();
-    return false;
+    return DOWNLOAD_FAILED;
   }
 
   // Skip to image data (skip palette if present)
-  int skip = dataOffset - 54;
-  while (skip-- > 0) stream->read(); // Skip extra palette data
-
-  // Decode image data into buffer
-  if (bitDepth == 8) {
-    handle8BitImageData(width, stream);
-  } else if (bitDepth == 24) {
-    handle24BitImageData(width, height, stream, 
-      (DISPLAY_WIDTH-width)/2,
-      (DISPLAY_HEIGHT-height)/2 + 20,
-      buffer, bufferSize);
+  if (!skipBytes(stream, dataOffset - BMP_HEADER_SIZE)) {
+    Serial.println("Failed to skip to image data");
+    http.end();
+    return DOWNLOAD_FAILED;
   }
 
+  bool ok = decodeBMPImageData(stream, bitDepth, width, height, topDown);
   http.end();
-  return true;
-}
-void handle8BitImageData(int width, WiFiClient *stream)
-{
-  // 4x4 Bayer ordered dithering matrix (0-15)
-  const uint8_t bayerMatrix[4][4] = {
-    {0,  8,  2,  10},
-    {12, 4,  14, 6},
-    {3,  11, 1,  9},
-    {15, 7,  13, 5}
-  };
 
-  int rowSize = ((width + 3) / 4) * 4;
-  uint8_t row[rowSize];
-
-  for (int y = DISPLAY_HEIGHT - 1; y >= 0; y--)
-  {
-    stream->readBytes(row, rowSize);
-    for (int x = 0; x < DISPLAY_WIDTH; x++)
-    {
-      if (x < width) { // Bounds check
-        uint8_t pixel = row[x];     // 0–255
-        
-        uint8_t level;
-        
-        // Never brighten black pixels with dithering
-        if (pixel < DITHERING_BLACK_LEVEL) {
-          level = 0; // Force black, no dithering
-        } else {
-          // Apply ordered dithering for non-black pixels
-          uint8_t ditherThreshold = bayerMatrix[y % 4][x % 4];
-          int ditheredPixel = pixel + (ditherThreshold * 16);
-          if (ditheredPixel > 255) ditheredPixel = 255;
-          
-          level = ditheredPixel >> 6; // Divide 0-255 into 0-3
-        }
-
-        int index = y * DISPLAY_WIDTH + x;
-        int byteIndex = index / 4;
-        int shift = (3 - (index % 4)) * 2;
-
-        buffer[byteIndex] &= ~(0x3 << shift);
-        buffer[byteIndex] |= (level << shift);
-      }
-    }
+  if (!ok) {
+    Serial.println("Image data incomplete, keeping current screen content");
+    return DOWNLOAD_FAILED;
   }
+  return DOWNLOAD_OK;
 }
 
+// Map an 8-bit grayscale value to a 2-bit display level (8-bit BMPs)
+static uint8_t quantize8Bit(uint8_t pixel, int x, int y) {
+  // Never brighten black pixels with dithering
+  if (pixel < DITHERING_BLACK_LEVEL) {
+    return 0; // Force black, no dithering
+  }
+  // Apply ordered dithering for non-black pixels
+  int ditheredPixel = pixel + (BAYER_MATRIX[y % 4][x % 4] * 16);
+  if (ditheredPixel > 255) ditheredPixel = 255;
+  return ditheredPixel >> 6; // Divide 0-255 into 0-3
+}
 
-void handle24BitImageData(int width, int height, WiFiClient *stream, int xStart, int yStart, uint8_t* buffer, size_t bufferSize)
+// Map an 8-bit grayscale value to a 2-bit display level (24-bit BMPs)
+static uint8_t quantize24Bit(uint8_t gray, int x, int y) {
+  // Never brighten black pixels with dithering
+  if (gray < DITHERING_BLACK_LEVEL) {
+    return 0; // Force black, no dithering
+  }
+  // Apply ordered dithering for non-black pixels
+  int ditheredGray = gray + (BAYER_MATRIX[y % 4][x % 4] * 4);
+  if (ditheredGray > 255) ditheredGray = 255;
+
+  // Map to 2-bit level (0-3) with dithering
+  if (ditheredGray < 64) return 0;
+  if (ditheredGray < 128) return 1;
+  if (ditheredGray < 212) return 2;
+  return 3;
+}
+
+// Reads the pixel rows of an 8- or 24-bit BMP from the stream and draws them
+// into the display buffer. The image is centered horizontally and vertically
+// (shifted down by IMAGE_Y_OFFSET when there is room). Returns false if the
+// stream ended before all rows were received.
+bool decodeBMPImageData(WiFiClient *stream, int bitDepth, int width, int height, bool topDown)
 {
-  // 4x4 Bayer ordered dithering matrix (0-15)
-  const uint8_t bayerMatrix[4][4] = {
-    {0,  8,  2,  10},
-    {12, 4,  14, 6},
-    {3,  11, 1,  9},
-    {15, 7,  13, 5}
-  };
+  const int bytesPerPixel = bitDepth / 8;
+  const int rowSize = ((width * bytesPerPixel + 3) / 4) * 4; // Rows are padded to 4 bytes
+  static uint8_t row[((DISPLAY_WIDTH * 3 + 3) / 4) * 4];     // Large enough for any accepted image
 
-  int rowSize = ((width * 3 + 3) / 4) * 4;
-  uint8_t row[rowSize];
+  int xStart = (DISPLAY_WIDTH - width) / 2;
+  int yStart = (DISPLAY_HEIGHT - height) / 2 + IMAGE_Y_OFFSET;
+  if (yStart > DISPLAY_HEIGHT - height) {
+    yStart = DISPLAY_HEIGHT - height;
+  }
 
-  memset(buffer, 0xFF, bufferSize);
-
-  for (int y = height - 1; y >= 0; y--)
+  for (int i = 0; i < height; i++)
   {
-    // if (y % 10 == 0) printf("Processing row %d. Free heap: %d\n", y, ESP.getFreeHeap());
-  
-    stream->readBytes(row, rowSize);
+    if (!readExact(stream, row, rowSize)) {
+      Serial.printf("Unexpected end of image data at row %d of %d\n", i, height);
+      return false;
+    }
+
+    // Bottom-up BMPs store the last row first
+    int y = topDown ? i : height - 1 - i;
+    int pixelY = yStart + y;
 
     for (int x = 0; x < width; x++)
     {
-      // BMP stores in BGR order
-      uint8_t b = row[x * 3 + 0];
-      uint8_t g = row[x * 3 + 1];
-      uint8_t r = row[x * 3 + 2];
-      // Convert to grayscale (simple average)
-      uint8_t gray = (uint16_t(r) + uint16_t(g) + uint16_t(b)) / 3;
-      
       int pixelX = xStart + x;
-      int pixelY = yStart + y;
-      
-      // Bounds check: only write if pixel is within display area
-      if (pixelX >= 0 && pixelX < DISPLAY_WIDTH && pixelY >= 0 && pixelY < DISPLAY_HEIGHT) {
-        uint8_t level;
-        
-        // Never brighten black pixels with dithering
-        if (gray < DITHERING_BLACK_LEVEL) {
-          level = 0; // Force black, no dithering
-        } else {
-          // Apply ordered dithering for non-black pixels
-          uint8_t ditherThreshold = bayerMatrix[pixelY % 4][pixelX % 4];
-          int ditheredGray = gray + (ditherThreshold * 4);
-          if (ditheredGray > 255) ditheredGray = 255;
-          
-          // Map to 2-bit level (0-3) with dithering
-          if (ditheredGray < 64) {
-            level = 0;
-          } else if (ditheredGray < 128) {
-            level = 1;
-          } else if (ditheredGray < 212) {
-            level = 2;
-          } else {
-            level = 3;
-          }
-        }
+      uint8_t level;
 
-        int index = pixelY * DISPLAY_WIDTH + pixelX;
-        int byteIndex = index / 4;
-        int shift = (3 - (index % 4)) * 2;
-
-        buffer[byteIndex] &= ~(0x3 << shift);
-        buffer[byteIndex] |= (level << shift);
+      if (bitDepth == 8) {
+        level = quantize8Bit(row[x], pixelX, pixelY);
+      } else {
+        // BMP stores in BGR order
+        uint8_t b = row[x * 3 + 0];
+        uint8_t g = row[x * 3 + 1];
+        uint8_t r = row[x * 3 + 2];
+        // Convert to grayscale (simple average)
+        uint8_t gray = (uint16_t(r) + uint16_t(g) + uint16_t(b)) / 3;
+        level = quantize24Bit(gray, pixelX, pixelY);
       }
+
+      SetPixel2bpp(buffer, pixelX, pixelY, level);
     }
   }
+  return true;
 }
-
