@@ -8,6 +8,8 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 
+#include "config.h"
+
 #define DISPLAY_WIDTH EPD_7IN5_V2_WIDTH
 #define DISPLAY_HEIGHT EPD_7IN5_V2_HEIGHT
 
@@ -17,30 +19,13 @@
 #define TRANSPARENT3        0x4 // More transparent
 #define TRANSPARENT4        0x5 // Even more transparent, one fourth of the pixels drawn
 
-const char* NETWORK_NAME = "Waveshare75-HA-dashboard";
+// Pixel values in the 2bpp display buffer (as interpreted by EPD_7IN5_V2_Display_4Gray)
+#define LEVEL_BLACK         0x0
+#define LEVEL_DARK_GRAY     0x1
+#define LEVEL_LIGHT_GRAY    0x2
+#define LEVEL_WHITE         0x3
 
-// Array of strings BMP_URL_1 and BMP_URL_2 as items
-const char* bmpUrls[] = {
-  "https://qrwmbaypgxaexdohocwh.supabase.co/functions/v1/xkcd-bmp",
-   "http://homeassistant:5000/4",
-  //  "http://homeassistant:5000/1",
-   "http://homeassistant:5000/3",
-  //  "http://homeassistant:5000/2"
-};
 static const int NUM_URLS = sizeof(bmpUrls) / sizeof(bmpUrls[0]);
-
-// Time zone (POSIX TZ string) used for the clock overlay
-static const char* TIME_ZONE = "CET-1CEST,M3.5.0,M10.5.0/3";
-
-// Brightness threshold for dithering - pixels darker than this will be forced to black without dithering
-static const int DITHERING_BLACK_LEVEL = 16;
-
-// Images smaller than the display are centered and then shifted down by this
-// many pixels (but never so far that the bottom of the image is cut off).
-static const int IMAGE_Y_OFFSET = 20;
-
-// Time between screen updates
-static const unsigned long REFRESH_INTERVAL_MS = 60000;
 
 // Network timeouts
 static const uint32_t HTTP_CONNECT_TIMEOUT_MS = 5000;
@@ -64,7 +49,7 @@ static const uint8_t BAYER_MATRIX[4][4] = {
   {15, 7,  13, 5}
 };
 
-// Display buffer, 2 bits per pixel (0=black, 1=dark gray, 2=light gray, 3=white)
+// Display buffer, 2 bits per pixel (see LEVEL_* above)
 uint8_t* buffer = nullptr; // Will be allocated dynamically
 size_t bufferSize = 0;
 
@@ -83,7 +68,7 @@ bool decodeBMPImageData(WiFiClient *stream, int bitDepth, int width, int height,
 
 // Set pixel in 2bpp buffer. Pixels outside the display are ignored.
 // x, y = pixel coordinate
-// color = 0=black, 1=dark gray, 2=light gray, 3=white
+// color = one of LEVEL_BLACK, LEVEL_DARK_GRAY, LEVEL_LIGHT_GRAY, LEVEL_WHITE
 void SetPixel2bpp(uint8_t* buffer, int x, int y, uint8_t color) {
   if (x < 0 || x >= DISPLAY_WIDTH || y < 0 || y >= DISPLAY_HEIGHT) {
     return;
@@ -212,7 +197,7 @@ void setup()
   WiFi.setAutoReconnect(true);
 
   // Get current time from time server and set local time zone
-  configTzTime(TIME_ZONE, "pool.ntp.org", "time.nist.gov");
+  configTzTime(TIME_ZONE, NTP_SERVER_1, NTP_SERVER_2);
 
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 10000)) {
@@ -282,7 +267,7 @@ void loop()
       localtime_r(&now, &timeinfo);
       char timeStr[16];
       strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
-      DrawString2bpp(buffer, 70, 440, timeStr, BLACK, WHITE, TRANSPARENT2, &Font24);
+      DrawString2bpp(buffer, CLOCK_X, CLOCK_Y, timeStr, LEVEL_BLACK, LEVEL_WHITE, TRANSPARENT2, &Font24);
     }
   } else {
     Serial.println("Failed to download BMP image.");
@@ -303,9 +288,9 @@ void loop()
 static void drawHttpError(const char* url, int httpCode, const char* message) {
   char codeStr[64];
   snprintf(codeStr, sizeof(codeStr), "HTTP error, status code: %d", httpCode);
-  DrawString2bpp(buffer, 70, 50, codeStr, BLACK, WHITE, TRANSPARENT2, &Font16);
-  DrawString2bpp(buffer, 70, 70, url, BLACK, WHITE, TRANSPARENT2, &Font12);
-  DrawString2bpp(buffer, 70, 90, message, BLACK, WHITE, TRANSPARENT2, &Font12);
+  DrawString2bpp(buffer, 70, 50, codeStr, LEVEL_BLACK, LEVEL_WHITE, TRANSPARENT2, &Font16);
+  DrawString2bpp(buffer, 70, 70, url, LEVEL_BLACK, LEVEL_WHITE, TRANSPARENT2, &Font12);
+  DrawString2bpp(buffer, 70, 90, message, LEVEL_BLACK, LEVEL_WHITE, TRANSPARENT2, &Font12);
 }
 
 // Downloads a BMP image from the given URL and decodes it into the display buffer.
@@ -399,11 +384,12 @@ DownloadResult downloadBMP(const char* url) {
   // Validate image size, color depth and format
   if ((bitDepth != 8 && bitDepth != 24) || compression != 0 ||
       width <= 0 || width > DISPLAY_WIDTH ||
-      height <= 0 || height > DISPLAY_HEIGHT ||
+      height <= 0 ||
       dataOffset < BMP_HEADER_SIZE || dataOffset > BMP_HEADER_SIZE + MAX_HEADER_SKIP) {
     Serial.println("Unsupported image size, color depth or format");
-    Serial.printf("Expected: max %dx%d, uncompressed 8- or 24-bit color depth\n", DISPLAY_WIDTH, DISPLAY_HEIGHT);
-    Serial.printf("Got: compression %u, data offset %u\n", (unsigned)compression, (unsigned)dataOffset);
+    Serial.printf("Expected: max %d pixels wide, uncompressed 8- or 24-bit color depth\n", DISPLAY_WIDTH);
+    Serial.printf("Got: %dx%d, %d-bit, compression %u, data offset %u\n",
+                  width, height, bitDepth, (unsigned)compression, (unsigned)dataOffset);
     http.end();
     return DOWNLOAD_FAILED;
   }
@@ -429,7 +415,7 @@ DownloadResult downloadBMP(const char* url) {
 static uint8_t quantize8Bit(uint8_t pixel, int x, int y) {
   // Never brighten black pixels with dithering
   if (pixel < DITHERING_BLACK_LEVEL) {
-    return 0; // Force black, no dithering
+    return LEVEL_BLACK; // Force black, no dithering
   }
   // Apply ordered dithering for non-black pixels
   int ditheredPixel = pixel + (BAYER_MATRIX[y % 4][x % 4] * 16);
@@ -441,22 +427,23 @@ static uint8_t quantize8Bit(uint8_t pixel, int x, int y) {
 static uint8_t quantize24Bit(uint8_t gray, int x, int y) {
   // Never brighten black pixels with dithering
   if (gray < DITHERING_BLACK_LEVEL) {
-    return 0; // Force black, no dithering
+    return LEVEL_BLACK; // Force black, no dithering
   }
   // Apply ordered dithering for non-black pixels
   int ditheredGray = gray + (BAYER_MATRIX[y % 4][x % 4] * 4);
   if (ditheredGray > 255) ditheredGray = 255;
 
   // Map to 2-bit level (0-3) with dithering
-  if (ditheredGray < 64) return 0;
-  if (ditheredGray < 128) return 1;
-  if (ditheredGray < 212) return 2;
-  return 3;
+  if (ditheredGray < 64) return LEVEL_BLACK;
+  if (ditheredGray < 128) return LEVEL_DARK_GRAY;
+  if (ditheredGray < 212) return LEVEL_LIGHT_GRAY;
+  return LEVEL_WHITE;
 }
 
 // Reads the pixel rows of an 8- or 24-bit BMP from the stream and draws them
 // into the display buffer. The image is centered horizontally and vertically
-// (shifted down by IMAGE_Y_OFFSET when there is room). Returns false if the
+// (shifted down by IMAGE_Y_OFFSET when there is room). Images taller than the
+// display are centered and cropped at the top and bottom. Returns false if the
 // stream ended before all rows were received.
 bool decodeBMPImageData(WiFiClient *stream, int bitDepth, int width, int height, bool topDown)
 {
@@ -465,9 +452,12 @@ bool decodeBMPImageData(WiFiClient *stream, int bitDepth, int width, int height,
   static uint8_t row[((DISPLAY_WIDTH * 3 + 3) / 4) * 4];     // Large enough for any accepted image
 
   int xStart = (DISPLAY_WIDTH - width) / 2;
-  int yStart = (DISPLAY_HEIGHT - height) / 2 + IMAGE_Y_OFFSET;
-  if (yStart > DISPLAY_HEIGHT - height) {
-    yStart = DISPLAY_HEIGHT - height;
+  int yStart = (DISPLAY_HEIGHT - height) / 2;
+  if (height < DISPLAY_HEIGHT) {
+    yStart += IMAGE_Y_OFFSET;
+    if (yStart > DISPLAY_HEIGHT - height) {
+      yStart = DISPLAY_HEIGHT - height;
+    }
   }
 
   for (int i = 0; i < height; i++)
@@ -480,6 +470,11 @@ bool decodeBMPImageData(WiFiClient *stream, int bitDepth, int width, int height,
     // Bottom-up BMPs store the last row first
     int y = topDown ? i : height - 1 - i;
     int pixelY = yStart + y;
+
+    // Rows outside the display (tall images) are read but not drawn
+    if (pixelY < 0 || pixelY >= DISPLAY_HEIGHT) {
+      continue;
+    }
 
     for (int x = 0; x < width; x++)
     {
