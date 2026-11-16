@@ -131,10 +131,14 @@ typedef enum {
 #define FONT_BACKGROUND     WHITE
 
 //4 Gray level
-#define  GRAY1 0x03 //Blackest
-#define  GRAY2 0x02
-#define  GRAY3 0x01 //gray
-#define  GRAY4 0x00 //white
+// Note: the original Waveshare comments here ("GRAY1 = blackest") do not
+// match the 7.5" V2 panel. With EPD_7IN5_V2_Display_4Gray() the values mean:
+//   0x03 = white, 0x02 = light gray, 0x01 = dark gray, 0x00 = black
+// main.cpp uses its own LEVEL_* names for these values instead.
+#define  GRAY1 0x03 //White on 7.5" V2
+#define  GRAY2 0x02 //Light gray on 7.5" V2
+#define  GRAY3 0x01 //Dark gray on 7.5" V2
+#define  GRAY4 0x00 //Black on 7.5" V2
 /**
  * The size of the point
 **/
