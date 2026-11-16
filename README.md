@@ -99,8 +99,9 @@ All user settings are in `include/config.h`:
 | `IMAGE_Y_OFFSET` | Downward shift for images smaller than the display |
 | `DITHERING_BLACK_LEVEL` | Pixels darker than this are drawn solid black |
 
-Images must be uncompressed 8-bit (grayscale) or 24-bit BMP files, no larger
-than 800x480 pixels. Smaller images are centered on the display.
+Images must be uncompressed 8-bit (grayscale) or 24-bit BMP files, at most
+800 pixels wide. Smaller images are centered on the display. Images taller
+than 480 pixels are centered vertically and cropped at the top and bottom.
 
 
 ## Building

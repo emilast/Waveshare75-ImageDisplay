@@ -384,11 +384,12 @@ DownloadResult downloadBMP(const char* url) {
   // Validate image size, color depth and format
   if ((bitDepth != 8 && bitDepth != 24) || compression != 0 ||
       width <= 0 || width > DISPLAY_WIDTH ||
-      height <= 0 || height > DISPLAY_HEIGHT ||
+      height <= 0 ||
       dataOffset < BMP_HEADER_SIZE || dataOffset > BMP_HEADER_SIZE + MAX_HEADER_SKIP) {
     Serial.println("Unsupported image size, color depth or format");
-    Serial.printf("Expected: max %dx%d, uncompressed 8- or 24-bit color depth\n", DISPLAY_WIDTH, DISPLAY_HEIGHT);
-    Serial.printf("Got: compression %u, data offset %u\n", (unsigned)compression, (unsigned)dataOffset);
+    Serial.printf("Expected: max %d pixels wide, uncompressed 8- or 24-bit color depth\n", DISPLAY_WIDTH);
+    Serial.printf("Got: %dx%d, %d-bit, compression %u, data offset %u\n",
+                  width, height, bitDepth, (unsigned)compression, (unsigned)dataOffset);
     http.end();
     return DOWNLOAD_FAILED;
   }
@@ -441,7 +442,8 @@ static uint8_t quantize24Bit(uint8_t gray, int x, int y) {
 
 // Reads the pixel rows of an 8- or 24-bit BMP from the stream and draws them
 // into the display buffer. The image is centered horizontally and vertically
-// (shifted down by IMAGE_Y_OFFSET when there is room). Returns false if the
+// (shifted down by IMAGE_Y_OFFSET when there is room). Images taller than the
+// display are centered and cropped at the top and bottom. Returns false if the
 // stream ended before all rows were received.
 bool decodeBMPImageData(WiFiClient *stream, int bitDepth, int width, int height, bool topDown)
 {
@@ -450,9 +452,12 @@ bool decodeBMPImageData(WiFiClient *stream, int bitDepth, int width, int height,
   static uint8_t row[((DISPLAY_WIDTH * 3 + 3) / 4) * 4];     // Large enough for any accepted image
 
   int xStart = (DISPLAY_WIDTH - width) / 2;
-  int yStart = (DISPLAY_HEIGHT - height) / 2 + IMAGE_Y_OFFSET;
-  if (yStart > DISPLAY_HEIGHT - height) {
-    yStart = DISPLAY_HEIGHT - height;
+  int yStart = (DISPLAY_HEIGHT - height) / 2;
+  if (height < DISPLAY_HEIGHT) {
+    yStart += IMAGE_Y_OFFSET;
+    if (yStart > DISPLAY_HEIGHT - height) {
+      yStart = DISPLAY_HEIGHT - height;
+    }
   }
 
   for (int i = 0; i < height; i++)
@@ -465,6 +470,11 @@ bool decodeBMPImageData(WiFiClient *stream, int bitDepth, int width, int height,
     // Bottom-up BMPs store the last row first
     int y = topDown ? i : height - 1 - i;
     int pixelY = yStart + y;
+
+    // Rows outside the display (tall images) are read but not drawn
+    if (pixelY < 0 || pixelY >= DISPLAY_HEIGHT) {
+      continue;
+    }
 
     for (int x = 0; x < width; x++)
     {

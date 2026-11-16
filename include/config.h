@@ -9,8 +9,8 @@
 static const char* NETWORK_NAME = "Waveshare75-HA-dashboard";
 
 // Images to show. The device cycles through them, showing one per refresh.
-// Each URL must return an uncompressed 8-bit (grayscale) or 24-bit BMP no
-// larger than 800x480 pixels. Both http:// and https:// are supported
+// Each URL must return an uncompressed 8-bit (grayscale) or 24-bit BMP at most
+// 800 pixels wide (taller than 480 pixels is cropped). Both http:// and https:// are supported
 // (https certificates are not verified).
 static const char* bmpUrls[] = {
   "https://qrwmbaypgxaexdohocwh.supabase.co/functions/v1/xkcd-bmp",
